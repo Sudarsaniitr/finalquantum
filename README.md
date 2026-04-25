@@ -274,5 +274,3 @@ while using one fewer copy register and shorter circuits.
 - **Noise model**: simulator uses a simple per-gate depolarising model (single-qubit error `p=0.001`, two-qubit error `p=0.01`).
 - **IBM hardware jobs** were executed on `ibm_kingston` (127-qubit Eagle QPU, open-plan access).
   - Job IDs are embedded in each result JSON for audit and reproduction.
-#   f i n a l q u a n t u m  
- 
