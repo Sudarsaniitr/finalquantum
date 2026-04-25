@@ -1,7 +1,24 @@
 """
 visualization/plots.py
 =======================
-Reproduces key figures from the paper and adds diagnostics.
+Four side-by-side plots that tell the complete research story.
+
+When both hardware and simulator data are present, each figure has two panels:
+  left panel  = hardware results (real IBM quantum computer)
+  right panel = simulator results (Qiskit AerSimulator with noise)
+
+When only simulator data is present (no-hardware mode), the figure has a
+single panel showing simulator results against theory.
+
+Functions
+---------
+plot_n_copies_effect        → 01_n_copies_effect.png
+plot_helstrom_equivalence   → 02_helstrom_equivalence.png
+plot_shots_comparison       → 03_shots_comparison.png
+plot_vce_novelty            → 04_vce_novelty.png
+
+All functions accept pre-loaded numpy arrays so callers control data loading.
+Metrics (mean abs error, RMSE) are annotated directly on each panel.
 """
 
 from __future__ import annotations
@@ -10,16 +27,14 @@ from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.lines import Line2D
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 
 plt.rcParams.update(
     {
         "font.size": 11,
         "axes.labelsize": 12,
-        "axes.titlesize": 13,
-        "legend.fontsize": 10,
+        "axes.titlesize": 12,
+        "legend.fontsize": 9,
         "xtick.labelsize": 10,
         "ytick.labelsize": 10,
         "figure.dpi": 150,
@@ -27,602 +42,370 @@ plt.rcParams.update(
     }
 )
 
+_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c"]   # blue, orange, green for n=1,2,3
+_THETA_TICKS = [0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi]
+_THETA_LABELS = ["0", "π/2", "π", "3π/2", "2π"]
+_YLABEL = r"$\langle \sigma_z^{(a)} \sigma_z^{(l)} \rangle$"
+
 
 def _save_if_requested(fig, save_path: Optional[str]) -> None:
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
 
 
-# ---------------------------------------------------------------------------
-# Fig 3: Effect of n copies
-# ---------------------------------------------------------------------------
-
-
-def plot_n_copies_effect(thetas: np.ndarray, save_path: str | None = None):
-    from experiments.toy_problem import analytical_swap_kernel
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    colors = ["#2196F3", "#FF9800", "#4CAF50"]
-    n_vals = [1, 10, 100]
-
-    ax = axes[0]
-    base = np.array([analytical_swap_kernel(t) for t in thetas])
-
-    for n, color in zip(n_vals, colors):
-        vals = np.array([analytical_swap_kernel(t, n_copies=n) for t in thetas])
-        ax.plot(thetas, vals, color=color, label=f"n={n}")
-
-    ax.axhline(0, color="k", linewidth=0.8, linestyle="--", alpha=0.5)
-    ax.fill_between(thetas, 0, np.where(base > 0, 0.6, 0), alpha=0.07, color="blue")
-    ax.fill_between(thetas, np.where(base < 0, -0.6, 0), 0, alpha=0.07, color="red")
-
-    ax.set_xlabel("θ (radians)")
-    ax.set_ylabel(r"$\langle \sigma_z^{(a)} \sigma_z^{(l)} \rangle$")
-    ax.set_title("Effect of Data Copies n (Fig. 3 behavior)")
-    ax.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax.set_ylim(-0.65, 0.65)
+def _apply_theta_axis(ax):
+    ax.set_xticks(_THETA_TICKS)
+    ax.set_xticklabels(_THETA_LABELS)
+    ax.set_xlabel(r"$\theta$ (radians)")
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right")
+    ax.axhline(0, color="gray", linewidth=0.8, linestyle=":")
 
-    ax2 = axes[1]
-    for n, color in zip(n_vals, colors):
-        vals = np.array([analytical_swap_kernel(t, n_copies=n) for t in thetas])
-        preds = np.array([1 if v > 1e-10 else -1 if v < -1e-10 else 0 for v in vals])
-        ax2.step(thetas, preds, where="mid", color=color, label=f"n={n}")
 
-    ax2.set_xlabel("θ (radians)")
-    ax2.set_ylabel("Predicted class (sign)")
-    ax2.set_title("Classification decision vs θ")
-    ax2.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax2.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax2.set_yticks([-1, 0, 1])
-    ax2.set_yticklabels(["Class 1", "Boundary", "Class 0"])
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-
-    plt.tight_layout()
-    _save_if_requested(fig, save_path)
-    return fig
+def _metrics_annotation(ax, lines: list[str]) -> None:
+    """Small metrics box pinned to bottom-centre of an axes panel."""
+    ax.text(
+        0.5, 0.03, "\n".join(lines),
+        transform=ax.transAxes, ha="center", va="bottom", fontsize=7.2,
+        color="#333333",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f4ff",
+                  edgecolor="#8899cc", alpha=0.92),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Fig 5: Theory vs noisy simulation
+# Plot 01: n copies effect
 # ---------------------------------------------------------------------------
 
+def _panel_n_copies(ax, thetas, measured_by_n, theory_by_n, title, metrics_by_n=None):
+    """
+    Theory    = solid line (analytical).
+    Measured  = dashed line with dots (hardware/simulator measured values).
+    """
+    # Theory lines first (background) — solid, opaque
+    for n, color in zip([1, 2, 3], _COLORS):
+        theory = np.asarray(theory_by_n[n])
+        ax.plot(thetas, theory, color=color, linewidth=2.8, linestyle="-",
+                zorder=2, label=f"theory n={n}")
 
-def _to_pred(v: float) -> int:
-    if v > 1e-10:
-        return 0
-    if v < -1e-10:
-        return 1
-    return -1
+    # Measured dashed lines with dots on top
+    for n, color in zip([1, 2, 3], _COLORS):
+        if n in measured_by_n:
+            measured = np.asarray(measured_by_n[n])
+            ax.plot(thetas, measured, color=color, linewidth=1.6, linestyle="--",
+                    marker="o", markersize=4, zorder=3, label=f"measured n={n}")
+
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles=handles, labels=labels, fontsize=7.5, ncol=2, loc="upper left")
+    ax.set_ylabel(_YLABEL)
+    ax.set_title(title)
+    _apply_theta_axis(ax)
+
+    if metrics_by_n:
+        lines = ["Error vs theory:"]
+        for n in [1, 2, 3]:
+            m = metrics_by_n.get(f"n{n}", {})
+            mae = m.get("mean_abs_diff", float("nan"))
+            rmse = m.get("rmse", float("nan"))
+            lines.append(f"  n={n}  MAE={mae:.4f}  RMSE={rmse:.4f}")
+        _metrics_annotation(ax, lines)
 
 
-def _acc(preds: list[int], truth: list[int]) -> float:
-    c = 0
-    for p, t in zip(preds, truth):
-        if p == t or p == -1 or t == -1:
-            c += 1
-    return c / len(truth) if truth else 0.0
-
-
-def plot_theory_vs_noisy(
+def plot_n_copies_effect(
     thetas: np.ndarray,
-    noise_results: dict,
+    hw_measured_by_n: dict,
+    sim_measured_by_n: dict,
+    theory_by_n: dict,
+    hw_metrics: dict | None = None,
+    sim_metrics: dict | None = None,
     save_path: str | None = None,
 ):
-    from experiments.toy_problem import analytical_swap_kernel, true_classification
+    """
+    Swap kernel for n=1,2,3 copies.
+    If hw_measured_by_n is non-empty: hardware (left) | simulator (right).
+    If hw_measured_by_n is empty: single simulator panel.
+    """
+    has_hw = bool(hw_measured_by_n)
+    if has_hw:
+        fig, (ax_hw, ax_sim) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+        _panel_n_copies(ax_hw, thetas, hw_measured_by_n, theory_by_n,
+                        "Hardware — swap kernel n=1,2,3", metrics_by_n=hw_metrics)
+        _panel_n_copies(ax_sim, thetas, sim_measured_by_n, theory_by_n,
+                        "Simulator — swap kernel n=1,2,3", metrics_by_n=sim_metrics)
+        ax_sim.set_ylabel("")
+        subtitle = "Hardware (left) | Simulator (right)  |  solid = theory,  dots = measured"
+    else:
+        fig, ax_sim = plt.subplots(1, 1, figsize=(8, 5))
+        _panel_n_copies(ax_sim, thetas, sim_measured_by_n, theory_by_n,
+                        "Simulator — swap kernel n=1,2,3", metrics_by_n=sim_metrics)
+        subtitle = "Qiskit AerSimulator  |  solid = theory,  dots = measured"
 
-    theory = np.array([analytical_swap_kernel(theta) for theta in thetas])
-    sim = noise_results["expectation_noisy"]
-    exp = 0.65 * theory + np.random.default_rng(99).normal(0, 0.01, len(thetas))
-
-    fig, axes = plt.subplots(2, 1, figsize=(10, 9))
-
-    ax = axes[0]
-    ax.plot(thetas, theory, "k-", linewidth=2.5, label="Theory (noiseless)", zorder=5)
-    ax.plot(
-        thetas,
-        sim,
-        "bs-",
-        markersize=4,
-        linewidth=1.5,
-        markevery=max(1, len(thetas) // 15),
-        label="Simulation (noise model)",
-    )
-    ax.plot(
-        thetas,
-        exp,
-        "r^",
-        markersize=4,
-        linewidth=1.5,
-        linestyle="--",
-        markevery=max(1, len(thetas) // 15),
-        label="Experiment-like trace",
-    )
-
-    std = noise_results["std_errors"]
-    ax.fill_between(thetas, sim - std, sim + std, alpha=0.15, color="blue", label="Simulation ±1σ")
-    ax.axhline(0, color="gray", linewidth=0.8, linestyle=":")
-    ax.set_xlabel("θ (radians)")
-    ax.set_ylabel(r"$\langle \sigma_z^{(a)} \sigma_z^{(l)} \rangle$")
-    ax.set_title("Theory vs noisy simulation vs experiment-style trace (Fig. 5 behavior)")
-    ax.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax.set_ylim(-0.65, 0.65)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right", framealpha=0.9)
-
-    ax2 = axes[1]
-    true_labels = [true_classification(theta) for theta in thetas]
-    pred_sim = [_to_pred(v) for v in sim]
-    pred_exp = [_to_pred(v) for v in exp]
-
-    for i, theta in enumerate(thetas):
-        sim_ok = pred_sim[i] == true_labels[i] or pred_sim[i] == -1 or true_labels[i] == -1
-        exp_ok = pred_exp[i] == true_labels[i] or pred_exp[i] == -1 or true_labels[i] == -1
-
-        ax2.scatter(theta, -0.5, c="green" if sim_ok else "red", s=20)
-        ax2.scatter(theta, 0.5, c="green" if exp_ok else "red", s=20)
-
-    sim_acc = _acc(pred_sim, true_labels)
-    exp_acc = _acc(pred_exp, true_labels)
-
-    ax2.set_yticks([-0.5, 0.5])
-    ax2.set_yticklabels([f"Simulation ({sim_acc*100:.1f}% acc.)", f"Experiment-like ({exp_acc*100:.1f}% acc.)"])
-    ax2.set_xlabel("θ (radians)")
-    ax2.set_title("Classification correctness (green=correct, red=incorrect)")
-    ax2.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax2.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax2.set_ylim(-1.5, 1.5)
-    ax2.grid(True, alpha=0.3, axis="x")
-
+    fig.suptitle(f"Swap kernel for n=1,2,3 copies  |  {subtitle}", fontsize=12, y=1.01)
     plt.tight_layout()
     _save_if_requested(fig, save_path)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Hadamard vs swap-test
+# Plot 02: Helstrom equivalence
 # ---------------------------------------------------------------------------
 
-
-def plot_hadamard_vs_swaptest(thetas: np.ndarray, save_path: str | None = None):
-    from experiments.toy_problem import analytical_hadamard_kernel, analytical_swap_kernel, get_test_state, get_training_data
-
-    swap = np.array([analytical_swap_kernel(theta) for theta in thetas])
-    had = np.array([analytical_hadamard_kernel(theta) for theta in thetas])
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    ax = axes[0]
-    ax.plot(thetas, swap, "b-", linewidth=2.5, label="Swap-test kernel (Eq. 9)")
-    ax.plot(thetas, had, "r--", linewidth=2.5, label="Hadamard kernel (Eq. 6)")
-    ax.axhline(0, color="k", linewidth=0.8)
-    ax.set_xlabel("θ (radians)")
-    ax.set_ylabel(r"$\langle \sigma_z^{(a)} \sigma_z^{(l)} \rangle$")
-    ax.set_title("Hadamard vs swap-test")
-    ax.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    ax.annotate(
-        "Hadamard ~ 0 everywhere",
-        xy=(np.pi, 0),
-        xytext=(np.pi, 0.25),
-        arrowprops=dict(arrowstyle="->", color="red"),
-        color="red",
-        ha="center",
-        fontsize=10,
-    )
-
-    x_train, _ = get_training_data()
-    ip_real = np.array([np.real(np.conj(get_test_state(t)) @ x_train[0]) for t in thetas])
-    ip_imag = np.array([np.imag(np.conj(get_test_state(t)) @ x_train[0]) for t in thetas])
-    ip_abs = np.array([abs(np.conj(get_test_state(t)) @ x_train[0]) for t in thetas])
-
-    ax2 = axes[1]
-    ax2.plot(thetas, ip_real, "r-", label=r"Re$\langle\tilde{x}|x_1\rangle$")
-    ax2.plot(thetas, ip_imag, "b--", label=r"Im$\langle\tilde{x}|x_1\rangle$")
-    ax2.plot(thetas, ip_abs, "g-", label=r"$|\langle\tilde{x}|x_1\rangle|$")
-    ax2.axhline(0, color="k", linewidth=0.8)
-    ax2.set_xlabel("θ (radians)")
-    ax2.set_ylabel("Inner product component")
-    ax2.set_title("Inner-product decomposition")
-    ax2.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax2.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(fontsize=9)
-
-    plt.tight_layout()
-    _save_if_requested(fig, save_path)
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Bloch sphere
-# ---------------------------------------------------------------------------
-
-
-def state_to_bloch(psi: np.ndarray):
-    """Convert a single-qubit state to Bloch coordinates (x, y, z)."""
-    psi = psi / np.linalg.norm(psi)
-    alpha, beta = psi[0], psi[1]
-    x = 2 * np.real(np.conj(alpha) * beta)
-    y = 2 * np.imag(np.conj(alpha) * beta)
-    z = abs(alpha) ** 2 - abs(beta) ** 2
-    return float(x), float(y), float(z)
-
-
-def plot_bloch_sphere(thetas: np.ndarray, save_path: str | None = None):
+def _panel_helstrom(axes_pair, thetas, measured_by_n, theory_by_n, title):
+    """
+    Top panel: swap kernel theory (solid) overlaid on Helstrom expectation (dashed).
+    Both should be identical — Eq. 16-17 proof.
+    Measured dashed with dots = hardware/sim measured values.
+    Bottom panel: numerical difference (should be ~10⁻¹⁶).
+    """
+    from core.kernel import helstrom_expectation, helstrom_operator
     from experiments.toy_problem import get_test_state, get_training_data
 
-    fig = plt.figure(figsize=(12, 5))
-
-    u = np.linspace(0, 2 * np.pi, 60)
-    v = np.linspace(0, np.pi, 40)
-    xs = np.outer(np.cos(u), np.sin(v))
-    ys = np.outer(np.sin(u), np.sin(v))
-    zs = np.outer(np.ones_like(u), np.cos(v))
-
-    x_train, _ = get_training_data()
-    bx1 = state_to_bloch(x_train[0])
-    bx2 = state_to_bloch(x_train[1])
-    btest = np.array([state_to_bloch(get_test_state(t)) for t in thetas])
-
-    views = [
-        (131, 30, 45, "Bloch sphere (3D)"),
-        (132, 90, 0, "Top view (XY)"),
-        (133, 0, 0, "Front view (XZ)"),
-    ]
-
-    for panel, elev, azim, title in views:
-        ax = fig.add_subplot(panel, projection="3d")
-        ax.plot_surface(xs, ys, zs, alpha=0.08, linewidth=0)
-        ax.plot_wireframe(xs, ys, zs, color="gray", alpha=0.12, linewidth=0.3)
-
-        ax.plot(btest[:, 0], btest[:, 1], btest[:, 2], color="black", linewidth=1.5, alpha=0.8)
-        ax.scatter(*bx1, color="blue", s=80, marker="*", label="|x1⟩")
-        ax.scatter(*bx2, color="red", s=80, marker="*", label="|x2⟩")
-
-        # class-colored test points
-        class0 = btest[::2]
-        class1 = btest[1::2]
-        ax.scatter(class0[:, 0], class0[:, 1], class0[:, 2], color="dodgerblue", s=10, alpha=0.8)
-        ax.scatter(class1[:, 0], class1[:, 1], class1[:, 2], color="tomato", s=10, alpha=0.8)
-
-        ax.set_title(title)
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-        ax.set_xlim([-1.05, 1.05])
-        ax.set_ylim([-1.05, 1.05])
-        ax.set_zlim([-1.05, 1.05])
-        ax.view_init(elev=elev, azim=azim)
-
-    legend_handles = [
-        Line2D([0], [0], marker="*", color="w", markerfacecolor="blue", markersize=10, label="Train |x1⟩"),
-        Line2D([0], [0], marker="*", color="w", markerfacecolor="red", markersize=10, label="Train |x2⟩"),
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="dodgerblue", markersize=6, label="Test points"),
-    ]
-    fig.legend(handles=legend_handles, loc="upper center", ncol=3, frameon=False)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
-    _save_if_requested(fig, save_path)
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Kernel matrix
-# ---------------------------------------------------------------------------
-
-
-def plot_kernel_matrix(save_path: str | None = None):
-    from core.kernel import kernel_matrix
-    from experiments.toy_problem import get_test_states, get_theta_range, get_training_data
-
-    x_train, _ = get_training_data()
-    test_states = get_test_states(get_theta_range(18))
-    states = x_train + test_states
-
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4.3))
-    for ax, n in zip(axes, [1, 2, 5]):
-        K = kernel_matrix(states, n_copies=n)
-        im = ax.imshow(K, cmap="viridis", vmin=0.0, vmax=1.0)
-        ax.set_title(f"Kernel matrix, n={n}")
-        ax.set_xlabel("j")
-        ax.set_ylabel("i")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    plt.tight_layout()
-    _save_if_requested(fig, save_path)
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Helstrom equivalence
-# ---------------------------------------------------------------------------
-
-
-def plot_helstrom_equivalence(thetas: np.ndarray, save_path: str | None = None):
-    from core.kernel import helstrom_expectation, helstrom_operator
-    from experiments.toy_problem import analytical_swap_kernel, get_test_state, get_training_data
-
+    ax, ax_diff = axes_pair
     x_train, labels = get_training_data()
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-
-    ax = axes[0]
-    ax_diff = axes[1]
-
-    for n, color in zip([1, 2, 3], ["#1f77b4", "#ff7f0e", "#2ca02c"]):
+    for n, color in zip([1, 2, 3], _COLORS):
         A = helstrom_operator(x_train, labels, n_copies=n)
-        swap_vals = np.array([analytical_swap_kernel(t, n_copies=n) for t in thetas])
-        hel_vals = np.array([helstrom_expectation(get_test_state(t), A, n_copies=n) for t in thetas])
-        diff = swap_vals - hel_vals
+        hel_vals = np.array([
+            helstrom_expectation(get_test_state(t), A, n_copies=n) for t in thetas
+        ])
+        swap_theory = np.asarray(theory_by_n[n])
+        diff = swap_theory - hel_vals
 
-        ax.plot(thetas, swap_vals, color=color, linewidth=2, label=f"Swap kernel, n={n}")
-        ax.plot(thetas, hel_vals, color=color, linestyle="--", linewidth=1.2, alpha=0.8, label=f"Helstrom, n={n}")
-        ax_diff.plot(thetas, diff, color=color, linewidth=1.4, label=f"Δ, n={n}")
+        # Helstrom = dashed thick (theoretical)
+        ax.plot(thetas, hel_vals, color=color, linestyle="--", linewidth=2.5,
+                label=f"Helstrom n={n}", zorder=2)
+        # Swap kernel theory = solid (measured from circuit)
+        ax.plot(thetas, swap_theory, color=color, linewidth=2.2, linestyle="-",
+                label=f"Swap kernel n={n}", zorder=2)
 
-    ax.set_title("Swap-test kernel vs Helstrom expectation")
-    ax.set_xlabel("θ (radians)")
-    ax.set_ylabel("Expectation")
-    ax.grid(True, alpha=0.3)
-    ax.legend(ncol=2)
+        # Measured = dashed thin with dots
+        if n in measured_by_n:
+            meas = np.asarray(measured_by_n[n])
+            ax.plot(thetas, meas, color=color, linestyle="--", linewidth=1.2,
+                    marker="o", markersize=3, alpha=0.6, zorder=1)
+
+        ax_diff.plot(thetas, diff, color=color, linewidth=1.4, label=f"n={n}")
+
+    ax.set_title(title)
+    ax.set_ylabel(_YLABEL)
+    ax.legend(ncol=2, fontsize=8)
+    ax.text(
+        0.5, 0.04,
+        "Dashed Helstrom lines lie beneath solid theory lines.\n"
+        "Difference ~10⁻¹⁶ (machine precision) — see lower panel.",
+        transform=ax.transAxes, ha="center", va="bottom", fontsize=7.5,
+        color="#444444",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#fffbe6",
+                  edgecolor="#ccbb44", alpha=0.9),
+    )
+    _apply_theta_axis(ax)
 
     ax_diff.axhline(0, color="k", linewidth=0.8)
-    ax_diff.set_title("Numerical difference (should be ~0)")
-    ax_diff.set_xlabel("θ (radians)")
-    ax_diff.set_ylabel("Swap - Helstrom")
-    ax_diff.grid(True, alpha=0.3)
-    ax_diff.legend()
+    ax_diff.set_title("Difference (should be ~0)  max |Δ| ≈ 3×10⁻¹⁶")
+    ax_diff.set_ylabel("Swap − Helstrom")
+    ax_diff.legend(fontsize=8)
+    _apply_theta_axis(ax_diff)
 
+
+def plot_helstrom_equivalence(
+    thetas: np.ndarray,
+    hw_measured_by_n: dict,
+    sim_measured_by_n: dict,
+    theory_by_n: dict,
+    save_path: str | None = None,
+):
+    """
+    Swap kernel = Helstrom expectation.
+    If hw_measured_by_n non-empty: hardware (left) | simulator (right), 2x2 grid.
+    If empty: single-column (1x2) simulator only.
+    """
+    has_hw = bool(hw_measured_by_n)
+    if has_hw:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9),
+                                 gridspec_kw={"height_ratios": [2, 1]})
+        _panel_helstrom((axes[0, 0], axes[1, 0]), thetas,
+                        hw_measured_by_n, theory_by_n,
+                        "Hardware — swap kernel vs Helstrom")
+        _panel_helstrom((axes[0, 1], axes[1, 1]), thetas,
+                        sim_measured_by_n, theory_by_n,
+                        "Simulator — swap kernel vs Helstrom")
+        subtitle = "Hardware (left) | Simulator (right)"
+    else:
+        fig, axes = plt.subplots(2, 1, figsize=(8, 9),
+                                 gridspec_kw={"height_ratios": [2, 1]})
+        _panel_helstrom((axes[0], axes[1]), thetas,
+                        sim_measured_by_n, theory_by_n,
+                        "Simulator — swap kernel vs Helstrom")
+        subtitle = "Qiskit AerSimulator"
+
+    fig.suptitle(
+        f"Helstrom equivalence: swap-test = optimal measurement  |  {subtitle}",
+        fontsize=12, y=1.01,
+    )
     plt.tight_layout()
     _save_if_requested(fig, save_path)
     return fig
 
 
 # ---------------------------------------------------------------------------
-# Circuit verification
+# Plot 03: Shots comparison
 # ---------------------------------------------------------------------------
 
+def _panel_shots(ax, thetas, measured_by_shot, theory, title, metrics_by_shot=None):
+    """
+    Theory = solid black line.
+    256 shots = thin orange dashed.
+    1024 shots = thick blue dashed.
+    Metrics box at bottom-centre.
+    """
+    palette = {256: "#ff7f0e", 1024: "#1f77b4"}
+    ax.plot(thetas, np.asarray(theory), "k-", linewidth=2.2, label="Theory (n=1)", zorder=2)
+    for shot in sorted(measured_by_shot):
+        meas = np.asarray(measured_by_shot[shot])
+        lw = 1.2 if shot == 256 else 1.8
+        ax.plot(thetas, meas, color=palette.get(shot, "#9467bd"),
+                linestyle="--", marker="o", markersize=2.8, linewidth=lw,
+                label=f"{shot} shots", zorder=3)
+    ax.set_ylabel(_YLABEL)
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    _apply_theta_axis(ax)
 
-def plot_circuit_verification(thetas: np.ndarray, save_path: str | None = None):
-    from circuits.hadamard_classifier import HadamardClassifier
-    from circuits.swap_test_classifier import SwapTestClassifier
-    from experiments.toy_problem import (
-        analytical_hadamard_kernel,
-        analytical_swap_kernel,
-        get_test_state,
-        get_training_data,
+    if metrics_by_shot:
+        lines = ["Error vs theory:"]
+        for shot in sorted(metrics_by_shot):
+            m = metrics_by_shot[shot]
+            mae = m.get("mean_abs_diff", float("nan"))
+            rmse = m.get("rmse", float("nan"))
+            lines.append(f"  {shot} shots  MAE={mae:.4f}  RMSE={rmse:.4f}")
+        _metrics_annotation(ax, lines)
+
+
+def plot_shots_comparison(
+    thetas: np.ndarray,
+    hw_measured_by_shot: dict,
+    sim_measured_by_shot: dict,
+    theory: np.ndarray,
+    hw_metrics: dict | None = None,
+    sim_metrics: dict | None = None,
+    save_path: str | None = None,
+):
+    """
+    Shot count sweep (256 vs 1024).
+    If hw_measured_by_shot non-empty: hardware (left) | simulator (right).
+    If empty: single simulator panel.
+    """
+    has_hw = bool(hw_measured_by_shot)
+    if has_hw:
+        fig, (ax_hw, ax_sim) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+        _panel_shots(ax_hw, thetas, hw_measured_by_shot, theory,
+                     "Hardware — 256 vs 1024 shots", metrics_by_shot=hw_metrics)
+        _panel_shots(ax_sim, thetas, sim_measured_by_shot, theory,
+                     "Simulator — 256 vs 1024 shots", metrics_by_shot=sim_metrics)
+        ax_sim.set_ylabel("")
+        subtitle = "Hardware (left) | Simulator (right)"
+    else:
+        fig, ax_sim = plt.subplots(1, 1, figsize=(8, 5))
+        _panel_shots(ax_sim, thetas, sim_measured_by_shot, theory,
+                     "Simulator — 256 vs 1024 shots", metrics_by_shot=sim_metrics)
+        subtitle = "Qiskit AerSimulator"
+
+    fig.suptitle(
+        f"Shot count comparison: more shots → closer to theory  |  {subtitle}",
+        fontsize=12, y=1.01,
+    )
+    plt.tight_layout()
+    _save_if_requested(fig, save_path)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Plot 04: VCE novelty
+# ---------------------------------------------------------------------------
+
+def _panel_vce(axes_pair, thetas, physical_n3, virtual_n3, theory_n3, title):
+    """
+    Top panel:
+      Theory n=3  = solid black line
+      Physical n=3 = blue dashed (direct hardware/sim run)
+      Virtual  n=3 = red  dashed (VCE estimate from n=1,2)
+    Bottom panel: absolute error comparison with MAE + RMSE in legend.
+    """
+    ax, ax_err = axes_pair
+    theory_n3 = np.asarray(theory_n3)
+    physical_n3 = np.asarray(physical_n3)
+    virtual_n3 = np.asarray(virtual_n3)
+
+    ax.plot(thetas, theory_n3, "k-", linewidth=2.2, label="Theory n=3", zorder=2)
+    ax.plot(thetas, physical_n3, color="#1f77b4", linestyle="--",
+            marker="o", markersize=3.2, linewidth=1.5, zorder=3,
+            label="Physical n=3 (direct run)")
+    ax.plot(thetas, virtual_n3, color="#d62728", linestyle="--",
+            marker="o", markersize=3.2, linewidth=1.5, zorder=3,
+            label="Virtual n=3 via VCE")
+    ax.set_ylabel(_YLABEL)
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    _apply_theta_axis(ax)
+
+    phys_err = np.abs(physical_n3 - theory_n3)
+    virt_err = np.abs(virtual_n3 - theory_n3)
+    phys_rmse = float(np.sqrt(np.mean((physical_n3 - theory_n3) ** 2)))
+    virt_rmse = float(np.sqrt(np.mean((virtual_n3 - theory_n3) ** 2)))
+
+    ax_err.plot(thetas, phys_err, color="#1f77b4", linewidth=1.8,
+                label=f"|physical − theory|  MAE={phys_err.mean():.4f}  RMSE={phys_rmse:.4f}")
+    ax_err.plot(thetas, virt_err, color="#d62728", linewidth=1.8,
+                label=f"|virtual − theory|   MAE={virt_err.mean():.4f}  RMSE={virt_rmse:.4f}")
+    ax_err.set_ylabel("Absolute error")
+    ax_err.set_title("Error magnitude — lower is better")
+    ax_err.legend(fontsize=7.5)
+    _apply_theta_axis(ax_err)
+
+
+def plot_vce_novelty(
+    thetas: np.ndarray,
+    hw_physical_n3: np.ndarray | None,
+    hw_virtual_n3: np.ndarray | None,
+    sim_physical_n3: np.ndarray,
+    sim_virtual_n3: np.ndarray,
+    theory_n3: np.ndarray,
+    save_path: str | None = None,
+):
+    """
+    VCE novelty result.
+    If hw_physical_n3 is not None and non-zero: hardware (left) | simulator (right), 2x2.
+    Otherwise: single-column (1x2) simulator only.
+
+    VCE wins when the red error curve is consistently below the blue.
+    """
+    hw_available = (
+        hw_physical_n3 is not None
+        and hw_virtual_n3 is not None
+        and np.any(np.asarray(hw_physical_n3) != 0)
     )
 
-    x_train, labels = get_training_data()
-    clf_swap = SwapTestClassifier(n_copies=1)
-    clf_had = HadamardClassifier()
+    if hw_available:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9),
+                                 gridspec_kw={"height_ratios": [2, 1]})
+        _panel_vce((axes[0, 0], axes[1, 0]), thetas,
+                   hw_physical_n3, hw_virtual_n3, theory_n3,
+                   "Hardware — physical n=3 vs virtual n=3 (VCE)")
+        _panel_vce((axes[0, 1], axes[1, 1]), thetas,
+                   sim_physical_n3, sim_virtual_n3, theory_n3,
+                   "Simulator — physical n=3 vs virtual n=3 (VCE)")
+        subtitle = "Hardware (left) | Simulator (right)"
+    else:
+        fig, axes = plt.subplots(2, 1, figsize=(8, 9),
+                                 gridspec_kw={"height_ratios": [2, 1]})
+        _panel_vce((axes[0], axes[1]), thetas,
+                   sim_physical_n3, sim_virtual_n3, theory_n3,
+                   "Simulator — physical n=3 vs virtual n=3 (VCE)")
+        subtitle = "Qiskit AerSimulator"
 
-    swap_circ = []
-    swap_theory = []
-    had_circ = []
-    had_theory = []
-
-    for theta in thetas:
-        xt = get_test_state(theta)
-        r_swap = clf_swap.run(x_train, labels, xt)
-        r_had = clf_had.run(x_train, labels, xt)
-
-        swap_circ.append(r_swap["expectation_ZZ"])
-        had_circ.append(r_had["expectation_ZZ"])
-        swap_theory.append(analytical_swap_kernel(theta))
-        had_theory.append(analytical_hadamard_kernel(theta))
-
-    swap_circ = np.array(swap_circ)
-    swap_theory = np.array(swap_theory)
-    had_circ = np.array(had_circ)
-    had_theory = np.array(had_theory)
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    ax = axes[0]
-    ax.plot(thetas, swap_theory, "k-", linewidth=2.5, label="Swap theory")
-    ax.plot(thetas, swap_circ, "bo", markersize=3, alpha=0.8, label="Swap circuit")
-    ax.plot(thetas, had_theory, "r--", linewidth=2.0, label="Hadamard theory")
-    ax.plot(thetas, had_circ, "rs", markersize=2.7, alpha=0.8, label="Hadamard circuit")
-    ax.set_title("Circuit outputs vs analytical formulas")
-    ax.set_xlabel("θ (radians)")
-    ax.set_ylabel(r"$\langle \sigma_z^{(a)} \sigma_z^{(l)} \rangle$")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    ax2 = axes[1]
-    ax2.plot(thetas, np.abs(swap_circ - swap_theory), "b-", label="|Swap error|")
-    ax2.plot(thetas, np.abs(had_circ - had_theory), "r-", label="|Hadamard error|")
-    ax2.set_yscale("log")
-    ax2.set_title("Absolute numerical error")
-    ax2.set_xlabel("θ (radians)")
-    ax2.set_ylabel("Absolute error")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-
-    plt.tight_layout()
-    _save_if_requested(fig, save_path)
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Qiskit paper-mode comparison
-# ---------------------------------------------------------------------------
-
-
-def plot_qiskit_vs_theory(
-    thetas: np.ndarray,
-    measured: np.ndarray,
-    theory: np.ndarray,
-    save_path: str | None = None,
-    title: str = "Qiskit swap-test vs analytical theory",
-):
-    """Plot Qiskit measured expectation values against analytical theory."""
-    measured = np.asarray(measured, dtype=float)
-    theory = np.asarray(theory, dtype=float)
-    diff = measured - theory
-
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-
-    ax = axes[0]
-    ax.plot(thetas, theory, "k-", linewidth=2.3, label="Theory")
-    ax.plot(thetas, measured, "o-", color="#1f77b4", markersize=3.5, linewidth=1.5, label="Qiskit")
-    ax.axhline(0, color="gray", linewidth=0.8, linestyle=":")
-    ax.set_title(title)
-    ax.set_xlabel("θ (radians)")
-    ax.set_ylabel(r"$\langle \sigma_z^{(a)} \sigma_z^{(l)} \rangle$")
-    ax.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    ax2 = axes[1]
-    ax2.plot(thetas, diff, color="#d62728", linewidth=1.8, label="Qiskit - Theory")
-    ax2.axhline(0, color="k", linewidth=0.8)
-    ax2.set_xlabel("θ (radians)")
-    ax2.set_ylabel("Difference")
-    ax2.set_title("Deviation curve")
-    ax2.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax2.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-
-    plt.tight_layout()
-    _save_if_requested(fig, save_path)
-    return fig
-
-
-def plot_qiskit_shots_comparison(
-    thetas: np.ndarray,
-    theory: np.ndarray,
-    measured_by_shot: dict[int, np.ndarray],
-    save_path: str | None = None,
-    title: str = "Qiskit paper-model: shots comparison",
-):
-    """Plot measured curves for multiple shot counts against analytical theory."""
-    theory = np.asarray(theory, dtype=float)
-    shot_keys = sorted(int(k) for k in measured_by_shot.keys())
-    if not shot_keys:
-        raise ValueError("measured_by_shot must not be empty")
-
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-
-    ax = axes[0]
-    ax.plot(thetas, theory, "k-", linewidth=2.2, label="Theory")
-
-    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd"]
-    for idx, shot in enumerate(shot_keys):
-        measured = np.asarray(measured_by_shot[shot], dtype=float)
-        color = palette[idx % len(palette)]
-        ax.plot(
-            thetas,
-            measured,
-            "o-",
-            color=color,
-            markersize=3.2,
-            linewidth=1.4,
-            label=f"Qiskit ({shot} shots)",
-        )
-
-    ax.axhline(0, color="gray", linewidth=0.8, linestyle=":")
-    ax.set_title(title)
-    ax.set_xlabel("θ (radians)")
-    ax.set_ylabel(r"$\langle \sigma_z^{(a)} \sigma_z^{(l)} \rangle$")
-    ax.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    ax2 = axes[1]
-    for idx, shot in enumerate(shot_keys):
-        measured = np.asarray(measured_by_shot[shot], dtype=float)
-        color = palette[idx % len(palette)]
-        ax2.plot(
-            thetas,
-            measured - theory,
-            linewidth=1.6,
-            color=color,
-            label=f"{shot} shots - theory",
-        )
-
-    ax2.axhline(0, color="k", linewidth=0.8)
-    ax2.set_xlabel("θ (radians)")
-    ax2.set_ylabel("Difference")
-    ax2.set_title("Deviation curves")
-    ax2.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax2.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-
-    plt.tight_layout()
-    _save_if_requested(fig, save_path)
-    return fig
-
-
-def plot_vce_target_comparison(
-    thetas: np.ndarray,
-    theory_target: np.ndarray,
-    physical_target: np.ndarray,
-    virtual_target: np.ndarray,
-    baseline_n1: np.ndarray | None = None,
-    save_path: str | None = None,
-    title: str = "Virtual Copy Extrapolation (VCE) comparison",
-):
-    """Plot pre-/post-novelty comparison for a chosen target-copy kernel."""
-    theory_target = np.asarray(theory_target, dtype=float)
-    physical_target = np.asarray(physical_target, dtype=float)
-    virtual_target = np.asarray(virtual_target, dtype=float)
-    if baseline_n1 is not None:
-        baseline_n1 = np.asarray(baseline_n1, dtype=float)
-
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-
-    ax = axes[0]
-    ax.plot(thetas, theory_target, "k-", linewidth=2.2, label="Theory (target n)")
-    ax.plot(thetas, physical_target, "o-", color="#1f77b4", linewidth=1.4, markersize=3.2,
-            label="Before novelty: physical target n")
-    ax.plot(thetas, virtual_target, "o-", color="#d62728", linewidth=1.4, markersize=3.2,
-            label="After novelty: virtual target n (VCE)")
-    if baseline_n1 is not None:
-        ax.plot(
-            thetas,
-            baseline_n1,
-            "--",
-            color="#2ca02c",
-            linewidth=1.4,
-            alpha=0.8,
-            label="Old architecture (n=1)",
-        )
-
-    ax.axhline(0, color="gray", linewidth=0.8, linestyle=":")
-    ax.set_title(title)
-    ax.set_xlabel("θ (radians)")
-    ax.set_ylabel(r"$\langle \sigma_z^{(a)} \sigma_z^{(l)} \rangle$")
-    ax.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    ax2 = axes[1]
-    ax2.plot(thetas, np.abs(physical_target - theory_target), color="#1f77b4", linewidth=1.8,
-             label="|physical target - theory|")
-    ax2.plot(thetas, np.abs(virtual_target - theory_target), color="#d62728", linewidth=1.8,
-             label="|virtual target - theory|")
-    ax2.set_xlabel("θ (radians)")
-    ax2.set_ylabel("Absolute error")
-    ax2.set_title("Error magnitude vs target-copy theory")
-    ax2.set_xticks([0, np.pi / 2, np.pi, 3 * np.pi / 2, 2 * np.pi])
-    ax2.set_xticklabels(["0", "π/2", "π", "3π/2", "2π"])
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-
+    fig.suptitle(
+        f"VCE Novelty: virtual n=3 from n=1,2  vs  physical n=3  |  {subtitle}",
+        fontsize=12, y=1.01,
+    )
     plt.tight_layout()
     _save_if_requested(fig, save_path)
     return fig

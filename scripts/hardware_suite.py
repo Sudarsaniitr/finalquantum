@@ -1,22 +1,32 @@
 """
 scripts/hardware_suite.py
 =========================
-Consolidated hardware runner for the full comparison suite.
+Run all swap-kernel experiments on IBM hardware and write clean result files.
 
-Minimises IBM global-catalog calls by building ONE QiskitRuntimeService and
-ONE backend reference, then reusing them for every theta sweep. Each sweep
-is saved to results/ as soon as it completes so transient network errors
-cannot wipe out the earlier successful runs.
+Outputs (results/ directory)
+-----------------------------
+  hardware_results.json   — n=1,2,3 kernel values + metrics + shots comparison
+  vce_summary.json        — VCE novelty: physical vs virtual n=3 (hardware section)
+
+  01_n_copies_effect.png      — updated with hardware data
+  02_helstrom_equivalence.png — updated with hardware data
+  03_shots_comparison.png     — updated with hardware data
+  04_vce_novelty.png          — updated with hardware data
+
+Usage
+-----
+  python scripts/hardware_suite.py
+  python scripts/hardware_suite.py --backend ibm_kingston --quick
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Sequence
 
 import numpy as np
 
@@ -51,8 +61,13 @@ def _save_json(path: str, data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
-def _make_service(max_attempts: int = 5) -> QiskitRuntimeService:
-    load_dotenv(os.path.join(ROOT, ".env"))
+def _load_json(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _make_service(env_file: str, max_attempts: int = 5) -> QiskitRuntimeService:
+    load_dotenv(env_file)
     token = os.getenv("QISKIT_IBM_TOKEN")
     instance = os.getenv("QISKIT_IBM_INSTANCE") or None
     channel = os.getenv("QISKIT_IBM_CHANNEL", "ibm_quantum_platform")
@@ -66,8 +81,7 @@ def _make_service(max_attempts: int = 5) -> QiskitRuntimeService:
             return svc
         except Exception as exc:
             last_err = exc
-            msg = str(exc)
-            print(f"[svc] failed: {type(exc).__name__}: {msg[:220]}", flush=True)
+            print(f"[svc] failed: {type(exc).__name__}: {str(exc)[:220]}", flush=True)
             if attempt < max_attempts:
                 delay = min(30, 2 * attempt)
                 print(f"[svc] sleeping {delay}s before retry", flush=True)
@@ -79,25 +93,17 @@ def _make_service(max_attempts: int = 5) -> QiskitRuntimeService:
 def _run_sweep(
     sampler: Sampler,
     backend,
-    circuit_family: str,
     copies: int,
     shots: int,
     thetas: np.ndarray,
-    optimization_level: int = 1,
-) -> dict:
-    if circuit_family == "swap_test":
-        circuits = [build_swap_test_toy_circuit(theta=float(t)) for t in thetas]
-    else:
-        circuits = [
-            build_product_state_n_copies_circuit(theta=float(t), copies=int(copies))
-            for t in thetas
-        ]
-
-    tqc = transpile(circuits, backend=backend, optimization_level=optimization_level)
-    print(
-        f"[job] submit family={circuit_family} copies={copies} shots={shots} circuits={len(circuits)}",
-        flush=True,
-    )
+) -> list[float]:
+    """Run product-state circuit (n=copies) for each theta, return expectation values."""
+    circuits = [
+        build_product_state_n_copies_circuit(theta=float(t), copies=int(copies))
+        for t in thetas
+    ]
+    tqc = transpile(circuits, backend=backend, optimization_level=1)
+    print(f"[job] submit copies={copies} shots={shots} circuits={len(circuits)}", flush=True)
     job = sampler.run(tqc, shots=shots)
     job_id = str(job.job_id())
     print(f"[job] id={job_id} waiting...", flush=True)
@@ -110,226 +116,179 @@ def _run_sweep(
 
     counts_list = []
     for i in range(len(circuits)):
-        if i < len(pubs):
-            counts_list.append(_extract_counts_from_sampler_pub(pubs[i]))
-        else:
-            counts_list.append({})
+        counts_list.append(_extract_counts_from_sampler_pub(pubs[i]) if i < len(pubs) else {})
 
     if all(len(c) == 0 for c in counts_list):
         raise RuntimeError("Hardware result returned no extractable counts.")
 
-    expectations = [expectation_from_counts(c) for c in counts_list]
-
-    meta = {
-        "mode": "hardware",
-        "circuit_family": circuit_family,
-        "copies": int(copies),
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "shots": int(shots),
-        "optimization_level": int(optimization_level),
-        "n_circuits": int(len(circuits)),
-        "weights": [0.5, 0.5],
-        "thetas": [float(t) for t in thetas],
-        "backend": getattr(backend, "name", None) if isinstance(getattr(backend, "name", None), str)
-                    else backend.name(),
-        "noise_enabled": False,
-        "noise_source": "hardware",
-        "job_id": job_id,
-    }
-
-    return {
-        "metadata": meta,
-        "counts": _serialize_counts(counts_list),
-        "expectation": [float(x) for x in expectations],
-    }
+    return [float(expectation_from_counts(c)) for c in counts_list]
 
 
-def main(backend_name_value: str = "ibm_kingston", quick: bool = True) -> int:
+def main(backend_name: str = "ibm_kingston", quick: bool = True, env_file: str = ".env") -> int:
     thetas = get_theta_range(30 if quick else 63)
     results_dir = _results_dir()
+    env_path = os.path.join(ROOT, env_file)
 
-    svc = _make_service()
-    print(f"[svc] resolving backend {backend_name_value}...", flush=True)
-    backend = svc.backend(backend_name_value)
+    svc = _make_service(env_path)
+    print(f"[svc] resolving backend {backend_name}...", flush=True)
+    backend = svc.backend(backend_name)
     print(f"[svc] backend={backend.name} resolved", flush=True)
     sampler = Sampler(mode=backend)
 
-    # ---------------- shots comparison (swap-test n=1) -----------------
-    shots_runs: dict[int, dict] = {}
-    for shots in (256, 1024):
-        run = _run_sweep(sampler, backend, "swap_test", 1, shots, thetas)
-        path = f"10_qiskit_swap_test_hardware_shots_{shots}_results.json"
-        _save_json(os.path.join(results_dir, path), run)
-        print(f"[save] results/{path}", flush=True)
-        shots_runs[shots] = run
+    # ------------------------------------------------------------------
+    # Step 1: n=1,2,3 at 1024 shots  (used for n-copies, Helstrom, VCE)
+    # ------------------------------------------------------------------
+    physical_curves: dict[int, list[float]] = {}
+    for n in [1, 2, 3]:
+        print(f"\n[sweep] n={n}, shots=1024")
+        physical_curves[n] = _run_sweep(sampler, backend, copies=n, shots=1024, thetas=thetas)
 
-    # shots-comparison summary + plot
-    theory_n1 = np.array([analytical_swap_kernel(t, n_copies=1) for t in thetas], dtype=float)
-    shot_curves: dict[int, np.ndarray] = {}
-    metrics: dict[str, dict] = {}
-    for shots, run in shots_runs.items():
-        measured = np.array(run["expectation"], dtype=float)
-        shot_curves[int(shots)] = measured
-        metrics[str(shots)] = curve_error_metrics(measured, theory_n1)
-
-    summary_shots = {
-        "metadata": {
-            "mode": "hardware",
-            "comparison": "old_architecture_shots",
-            "shot_values": sorted(shots_runs.keys()),
-            "thetas": [float(t) for t in thetas],
-            "n_theta": int(len(thetas)),
-            "backend": backend_name_value,
-        },
-        "theory_n1": [float(x) for x in theory_n1],
-        "runs": {str(k): v for k, v in shots_runs.items()},
-        "metrics_vs_theory_n1": metrics,
-        "curves_by_shot": {str(k): [float(v) for v in vals] for k, vals in shot_curves.items()},
+    theory_by_n = {
+        n: [float(analytical_swap_kernel(t, n_copies=n)) for t in thetas]
+        for n in [1, 2, 3]
     }
-    _save_json(
-        os.path.join(results_dir, "11_qiskit_swap_test_hardware_shots_comparison.json"),
-        summary_shots,
-    )
-    print("[save] results/11_qiskit_swap_test_hardware_shots_comparison.json", flush=True)
+    metrics_n = {
+        f"n{n}": curve_error_metrics(np.array(physical_curves[n]), np.array(theory_by_n[n]))
+        for n in [1, 2, 3]
+    }
 
-    try:
-        import matplotlib
+    # ------------------------------------------------------------------
+    # Step 2: shots comparison — n=1 at 256 and 1024
+    # ------------------------------------------------------------------
+    print("\n[sweep] shots comparison n=1, shots=256")
+    shots_256 = _run_sweep(sampler, backend, copies=1, shots=256, thetas=thetas)
+    shots_by_count = {
+        "256": shots_256,
+        "1024": physical_curves[1],  # reuse 1024 run from step 1
+    }
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+    # ------------------------------------------------------------------
+    # Step 3: Write hardware_results.json
+    # ------------------------------------------------------------------
+    hw_results = {
+        "backend": f"IBM hardware ({backend_name})",
+        "shots": 1024,
+        "thetas": [float(t) for t in thetas],
+        "theory": {f"n{n}": theory_by_n[n] for n in [1, 2, 3]},
+        "measured": {f"n{n}": physical_curves[n] for n in [1, 2, 3]},
+        "metrics": metrics_n,
+        "shots_by_count": shots_by_count,
+    }
+    hw_path = os.path.join(results_dir, "hardware_results.json")
+    _save_json(hw_path, hw_results)
+    print(f"\n[save] results/hardware_results.json", flush=True)
 
-        from visualization.plots import plot_qiskit_shots_comparison
+    # ------------------------------------------------------------------
+    # Step 4: VCE — build virtual n=3 from n=1,2 measurements
+    # ------------------------------------------------------------------
+    phys_np = {n: np.array(physical_curves[n]) for n in [1, 2, 3]}
+    vce_curves = build_vce_curves(phys_np, target_copies=3)
+    virtual_n3 = [float(x) for x in vce_curves["virtual_n3_from_12"]]
+    theory_n3 = [float(analytical_swap_kernel(t, n_copies=3)) for t in thetas]
 
-        fig = plot_qiskit_shots_comparison(
-            thetas,
-            theory_n1,
-            measured_by_shot=shot_curves,
-            title="Old architecture (swap-test n=1) shots comparison [hardware]",
-            save_path=os.path.join(results_dir, "12_qiskit_swap_test_hardware_shots_comparison.png"),
-        )
-        plt.close(fig)
-        print("[save] results/12_qiskit_swap_test_hardware_shots_comparison.png", flush=True)
-    except Exception as e:
-        print(f"[warn] shots comparison plot failed: {e}", flush=True)
+    hw_vce_metrics = {
+        "physical_n3": curve_error_metrics(np.array(physical_curves[3]), np.array(theory_n3)),
+        "virtual_n3": curve_error_metrics(np.array(virtual_n3), np.array(theory_n3)),
+    }
 
-    # ------------- VCE novelty sweeps (product_state n=1,2,3) -------------
-    physical_curves: dict[int, np.ndarray] = {}
-    raw_runs_nov: dict[str, dict] = {}
-    for copies in (1, 2, 3):
-        run = _run_sweep(sampler, backend, "product_state", copies, 1024, thetas)
-        path = f"13_qiskit_product_state_hardware_copies_{copies}_shots_1024_results.json"
-        _save_json(os.path.join(results_dir, path), run)
-        print(f"[save] results/{path}", flush=True)
-        raw_runs_nov[str(copies)] = run
-        physical_curves[copies] = np.array(run["expectation"], dtype=float)
-
-    # VCE summary
-    summary_vce: dict = {
-        "metadata": {
-            "mode": "hardware",
+    # ------------------------------------------------------------------
+    # Step 5: Update vce_summary.json with hardware section
+    # ------------------------------------------------------------------
+    vce_path = os.path.join(results_dir, "vce_summary.json")
+    if os.path.exists(vce_path):
+        vce_data = _load_json(vce_path)
+    else:
+        vce_data = {
+            "description": "VCE: estimate n=3 kernel from n=1,2 measurements",
+            "target_copies": 3,
             "shots": 1024,
-            "physical_copies": [1, 2, 3],
-            "target_copies": 5,
             "thetas": [float(t) for t in thetas],
-            "n_theta": int(len(thetas)),
-            "backend": backend_name_value,
-        },
-        "raw_runs": raw_runs_nov,
-        "physical_curves": {str(k): [float(x) for x in v] for k, v in physical_curves.items()},
-        "theory_curves": {},
-        "virtual_curves": {},
-        "metrics": {},
+            "theory_n3": theory_n3,
+        }
+
+    vce_data["hardware"] = {
+        "physical_n3": physical_curves[3],
+        "virtual_n3": virtual_n3,
+        "metrics": hw_vce_metrics,
     }
+    _save_json(vce_path, vce_data)
+    print("[save] results/vce_summary.json", flush=True)
 
-    for copies in sorted(physical_curves.keys()):
-        th = np.array([analytical_swap_kernel(t, n_copies=copies) for t in thetas], dtype=float)
-        summary_vce["theory_curves"][str(copies)] = [float(x) for x in th]
-        summary_vce["metrics"][f"physical_n{copies}_vs_theory_n{copies}"] = curve_error_metrics(
-            physical_curves[copies], th
-        )
-
-    theory_target = np.array([analytical_swap_kernel(t, n_copies=5) for t in thetas], dtype=float)
-    summary_vce["theory_curves"]["5"] = [float(x) for x in theory_target]
-
-    vce_curves = build_vce_curves(physical_curves, target_copies=5)
-    summary_vce["virtual_curves"] = vce_curves
-
-    virtual_n3 = np.array(vce_curves["virtual_n3_from_12"], dtype=float)
-    theory_n3 = np.array([analytical_swap_kernel(t, n_copies=3) for t in thetas], dtype=float)
-    summary_vce["theory_curves"]["3"] = [float(x) for x in theory_n3]
-    summary_vce["metrics"]["virtual_n3_from_12_vs_theory_n3"] = curve_error_metrics(
-        virtual_n3, theory_n3
-    )
-    virtual_target = np.array(vce_curves["virtual_target_from_123"], dtype=float)
-    summary_vce["metrics"]["virtual_n5_from_123_vs_theory_n5"] = curve_error_metrics(
-        virtual_target, theory_target
-    )
-    summary_vce["metrics"]["pre_novelty_physical_n3_vs_theory_n3"] = curve_error_metrics(
-        physical_curves[3], theory_n3
-    )
-    summary_vce["metrics"]["post_novelty_virtual_n3_vs_theory_n3"] = curve_error_metrics(
-        virtual_n3, theory_n3
-    )
-
-    _save_json(
-        os.path.join(results_dir, "14_qiskit_vce_hardware_shots_1024_summary.json"),
-        summary_vce,
-    )
-    print("[save] results/14_qiskit_vce_hardware_shots_1024_summary.json", flush=True)
-
+    # ------------------------------------------------------------------
+    # Step 6: Regenerate all 4 plots with updated hardware data
+    # ------------------------------------------------------------------
     try:
         import matplotlib
-
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from visualization.plots import (
+            plot_n_copies_effect, plot_helstrom_equivalence,
+            plot_shots_comparison, plot_vce_novelty,
+        )
 
-        from visualization.plots import plot_vce_target_comparison
+        t = np.array([float(x) for x in thetas])
+        theory = {n: np.array(theory_by_n[n]) for n in [1, 2, 3]}
+        hw_m = {n: np.array(physical_curves[n]) for n in [1, 2, 3]}
 
-        fig = plot_vce_target_comparison(
-            thetas,
-            theory_target=theory_n3,
-            physical_target=physical_curves[3],
-            virtual_target=virtual_n3,
-            baseline_n1=shot_curves.get(1024),
-            title="Pre/Post novelty comparison at 1024 shots [hardware] (target n=3)",
-            save_path=os.path.join(
-                results_dir, "15_qiskit_vce_hardware_shots_1024_pre_post.png"
-            ),
+        sim_path = os.path.join(results_dir, "simulator_results.json")
+        sim = _load_json(sim_path) if os.path.exists(sim_path) else {}
+        sim_m = {n: np.array(sim["measured"][f"n{n}"]) for n in [1, 2, 3]} \
+            if sim.get("measured") else {}
+        sim_metrics_n = sim.get("metrics", {})
+
+        # Compute shots metrics
+        theory_n1 = np.array(theory_by_n[1])
+        hw_shots = {int(k): np.array(v) for k, v in shots_by_count.items()}
+        sim_shots = {int(k): np.array(v) for k, v in sim.get("shots_by_count", {}).items()}
+        hw_shots_metrics = {s: curve_error_metrics(v, theory_n1) for s, v in hw_shots.items()}
+        sim_shots_metrics = {s: curve_error_metrics(v, theory_n1) for s, v in sim_shots.items()}
+
+        fig = plot_n_copies_effect(t, hw_m, sim_m, theory,
+            hw_metrics=metrics_n, sim_metrics=sim_metrics_n,
+            save_path=os.path.join(results_dir, "01_n_copies_effect.png"))
+        plt.close(fig)
+        print("[save] results/01_n_copies_effect.png", flush=True)
+
+        fig = plot_helstrom_equivalence(t, hw_m, sim_m, theory,
+            save_path=os.path.join(results_dir, "02_helstrom_equivalence.png"))
+        plt.close(fig)
+        print("[save] results/02_helstrom_equivalence.png", flush=True)
+
+        fig = plot_shots_comparison(t, hw_shots, sim_shots, theory[1],
+            hw_metrics=hw_shots_metrics, sim_metrics=sim_shots_metrics,
+            save_path=os.path.join(results_dir, "03_shots_comparison.png"))
+        plt.close(fig)
+        print("[save] results/03_shots_comparison.png", flush=True)
+
+        vce_reload = _load_json(vce_path)
+        fig = plot_vce_novelty(
+            t,
+            hw_physical_n3=np.array(vce_reload["hardware"]["physical_n3"]),
+            hw_virtual_n3=np.array(vce_reload["hardware"]["virtual_n3"]),
+            sim_physical_n3=np.array(vce_reload["simulator"]["physical_n3"]) if vce_reload.get("simulator") else np.zeros_like(t),
+            sim_virtual_n3=np.array(vce_reload["simulator"]["virtual_n3"]) if vce_reload.get("simulator") else np.zeros_like(t),
+            theory_n3=np.array(vce_reload["theory_n3"]),
+            save_path=os.path.join(results_dir, "04_vce_novelty.png"),
         )
         plt.close(fig)
-        print("[save] results/15_qiskit_vce_hardware_shots_1024_pre_post.png", flush=True)
-    except Exception as e:
-        print(f"[warn] vce plot failed: {e}", flush=True)
+        print("[save] results/04_vce_novelty.png", flush=True)
 
-    # combined suite summary
-    suite = {
-        "metadata": {
-            "mode": "hardware",
-            "high_shots": 1024,
-            "backend": backend_name_value,
-            "requested": {
-                "shots_comparison": [256, 1024],
-                "vce_physical_copies": [1, 2, 3],
-                "vce_target_copies": 5,
-            },
-        },
-        "shots_comparison_summary": summary_shots,
-        "vce_summary": summary_vce,
-    }
-    _save_json(
-        os.path.join(results_dir, "16_qiskit_hardware_comparison_suite_summary.json"),
-        suite,
-    )
-    print("[save] results/16_qiskit_hardware_comparison_suite_summary.json", flush=True)
-    print("[done] hardware suite complete", flush=True)
+    except Exception as exc:
+        print(f"[warn] plot generation failed: {exc}", flush=True)
+
+    print("\n[done] hardware suite complete", flush=True)
     return 0
 
 
 if __name__ == "__main__":
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", default="ibm_kingston")
-    ap.add_argument("--quick", action="store_true", default=True)
+    ap = argparse.ArgumentParser(description="Run IBM hardware experiments")
+    ap.add_argument("--backend", default="ibm_kingston",
+                    help="IBM backend name (default: ibm_kingston)")
+    ap.add_argument("--quick", action="store_true", default=True,
+                    help="Use 30 theta points (default: True)")
+    ap.add_argument("--full", action="store_true",
+                    help="Use 63 theta points instead of 30")
+    ap.add_argument("--env-file", default=".env",
+                    help="Path to .env file with QISKIT_IBM_* credentials")
     args = ap.parse_args()
-    raise SystemExit(main(args.backend, args.quick))
+    raise SystemExit(main(args.backend, quick=not args.full, env_file=args.env_file))
